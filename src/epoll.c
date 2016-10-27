@@ -42,6 +42,7 @@ static PNTDEVICEIOCONTROLFILE pNtDeviceIoControlFile;
 /* State associated with a epoll handle. */
 struct epoll_port_data_s {
   HANDLE iocp;
+  HANDLE thread;
   SOCKET peer_sockets[ARRAY_COUNT(AFD_PROVIDER_IDS)];
   RB_HEAD(epoll_sock_data_tree, epoll_sock_data_s) sock_data_tree;
   epoll_sock_data_t* attn_list;
@@ -78,6 +79,17 @@ RB_GENERATE_STATIC(epoll_sock_data_tree,
                    epoll_sock_data_s,
                    tree_entry, epoll__compare_sock_data)
 
+static VOID CALLBACK APCnoOp(_In_ ULONG_PTR dwParam) {
+}
+
+void wakeup(epoll_port_data_t* port_data) {
+  HANDLE thread = port_data->thread;
+  if (!thread) {
+    return;
+  }
+
+  QueueUserAPC(&APCnoOp, thread, 0);
+}
 
 epoll_t epoll_create() {
   epoll_port_data_t* port_data;
@@ -91,7 +103,7 @@ epoll_t epoll_create() {
     epoll__initialized = 1;
   }
 
-  port_data = malloc(sizeof *port_data);
+  port_data = malloc(sizeof(epoll_port_data_t));
   if (port_data == NULL) {
     SetLastError(ERROR_OUTOFMEMORY);
     return NULL;
@@ -109,6 +121,7 @@ epoll_t epoll_create() {
   port_data->iocp = iocp;
   port_data->attn_list = NULL;
   port_data->pending_ops_count = 0;
+  port_data->thread = NULL;
 
   memset(&port_data->peer_sockets, 0, sizeof port_data->peer_sockets);
   RB_INIT(&port_data->sock_data_tree);
@@ -205,6 +218,7 @@ int epoll_ctl(epoll_t port_handle, int op, SOCKET sock,
       port_data->attn_list = sock_data;
       sock_data->flags |= EPOLL__SOCK_LISTED;
 
+      wakeup(port_data);
       return 0;
     }
 
@@ -246,6 +260,8 @@ int epoll_ctl(epoll_t port_handle, int op, SOCKET sock,
 
       sock_data->registered_events = ev->events | EPOLLERR | EPOLLHUP;
       sock_data->user_data = ev->data.u64;
+
+      wakeup(port_data);
       return 0;
     }
 
@@ -290,6 +306,7 @@ int epoll_ctl(epoll_t port_handle, int op, SOCKET sock,
         assert(sock_data->op_generation > 0);
       }
 
+      wakeup(port_data);
       return 0;
     }
 
@@ -305,6 +322,7 @@ int epoll_wait(epoll_t port_handle, struct epoll_event* events, int maxevents,
   epoll_port_data_t* port_data;
   DWORD due;
   DWORD gqcs_timeout;
+  HANDLE current_thread_handle;
 
   port_data = (epoll_port_data_t*) port_handle;
 
@@ -369,13 +387,26 @@ int epoll_wait(epoll_t port_handle, struct epoll_event* events, int maxevents,
     if ((int) max_entries > maxevents)
       max_entries = maxevents;
 
+    DuplicateHandle(
+        GetCurrentProcess(),
+        GetCurrentThread(),
+        GetCurrentProcess(),
+        (LPHANDLE) &current_thread_handle,
+        0,
+        TRUE,
+        DUPLICATE_SAME_ACCESS
+    );
+
+    port_data->thread = current_thread_handle;
     result = GetQueuedCompletionStatusEx(port_data->iocp,
                                           entries,
                                           max_entries,
                                           &count,
                                           gqcs_timeout,
-                                          FALSE);
+                                          TRUE);
 
+    CloseHandle(port_data->thread);
+    port_data->thread = NULL;
     if (!result) {
       DWORD error = GetLastError();
       if (error == WAIT_TIMEOUT) {
@@ -559,6 +590,10 @@ int epoll_close(epoll_t port_handle) {
 
   /* Close the I/O completion port. */
   CloseHandle(port_data->iocp);
+  if (port_data->thread) {
+    CloseHandle(port_data->thread);
+    port_data->thread = NULL;
+  }
 
   /* Finally, remove the port data. */
   free(port_data);
